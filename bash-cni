@@ -1,0 +1,199 @@
+#!/bin/bash -e
+
+# if [[ ${DEBUG} -gt 0 ]]; then set -x; fi
+
+exec 3>&1 # make stdout available as fd 3 for the result
+exec &>> /var/log/bash-cni-plugin.log
+
+TOKEN="TOKEN_HERE"
+
+IP_STORE=/tmp/reserved_ips # all reserved ips will be stored there
+
+echo "CNI command: $CNI_COMMAND" 
+
+stdin=`cat /dev/stdin`
+echo "stdin: $stdin"
+K8S_POD_NAMESPACE=$(echo $CNI_ARGS | tr ";" "\n" | grep K8S_POD_NAMESPACE= | cut -d"=" -f2 | head -n 1)
+K8S_POD_NAME=$(echo $CNI_ARGS | tr ";" "\n" | grep K8S_POD_NAME= | cut -d"=" -f2 | head -n 1)
+annotations=$(curl -s -X GET https://127.0.0.1:6443/api/v1/namespaces/$K8S_POD_NAMESPACE/pods/$K8S_POD_NAME --header "Authorization: Bearer $TOKEN" --insecure | jq -r ".metadata.annotations")
+
+SEMAPHORE_FILE="/tmp/my_semaphore.lock"
+
+label_static () { 
+        local b=$(echo "$stdin" | jq -r ".args.cni.labels[] | select(.key==\"$1\").value")
+        if [[ -n $b ]]; then
+                echo $b
+        else
+                echo $2
+        fi
+}
+
+label () {
+        local b=$(echo "$annotations" | jq -r ".[\"local.bash-cni/$CNI_IFNAME.$1\"]")
+        if [[ -n $b && $b != "null" ]]; then
+                echo $b
+        else
+                echo $(label_static $1 $2) 
+        fi
+}
+
+
+bridge_name=$(label bridge_name bash0)
+prefix="/var/run/netns/"
+namespace=${CNI_NETNS#"$prefix"}
+
+allocate_ip(){
+	for ip in "${all_ips[@]}"
+	do
+		reserved=false
+		for reserved_ip in "${reserved_ips[@]}"
+		do
+			if [ "$ip" = "$reserved_ip" ]; then
+				reserved=true
+				break
+			fi
+		done
+		if [ "$reserved" = false ] ; then
+			echo "$ip"$'\t'"$CNI_CONTAINERID"$'\t'"$CNI_IFNAME" >> $IP_STORE
+			echo "$ip"
+			return
+		fi
+	done
+}
+
+case $CNI_COMMAND in
+ADD)
+	#echo $(curl -X GET https://127.0.0.1:6443/api/v1/namespaces/default/pods --header "Authorization: Bearer $TOKEN" --insecure)
+	#echo $CNI_CONTAINERID
+	network=$(echo "$stdin" | jq -r ".network")
+	subnet=$(echo "$stdin" | jq -r ".subnet")
+	subnet_mask_size=$(echo $subnet | awk -F  "/" '{print $2}')
+
+	all_ips=$(nmap -sL $subnet | grep "Nmap scan report" | awk '{print $NF}')
+	all_ips=(${all_ips[@]})
+	skip_ip=${all_ips[0]}
+	gw_ip=${all_ips[1]}
+	while true; do
+  	if mkdir "$SEMAPHORE_FILE" 2>/dev/null; then
+    		echo "Semaphore acquired"
+    		break
+  	else
+    		echo "Waiting for semaphore..."
+    		sleep 1
+  	fi
+	done
+        if ! ip link show $bridge_name; then
+	 	brctl addbr $bridge_name
+		ip a a $gw_ip dev $bridge_name
+
+	fi
+	reserved_ips=$(cat $IP_STORE | cut -f1 2> /dev/null || printf "$skip_ip\n$gw_ip\n") # reserving 10.244.0.0 and 10.244.0.1 
+	reserved_ips=(${reserved_ips[@]})
+	asked_ip=$(label ip)
+	#NO IPv4 validation
+	if [[ -z $asked_ip ]]; then
+		container_ip=$(allocate_ip)
+		else
+		container_ip=$asked_ip
+		echo "$asked_ip"$'\t'"$CNI_CONTAINERID"$'\t'"$CNI_IFNAME" >> $IP_STORE
+	fi
+	rmdir "$SEMAPHORE_FILE"
+	asked_mac=$(label mac)
+	if [[ -z $asked_mac ]]; then  
+		container_mac="00:0A:28$(hexdump -n 3 -ve '1/1 ":%.2x"' /dev/random)"
+                else
+                container_mac=$asked_mac  
+        fi
+	rand=$(tr -dc 'A-F0-9' < /dev/urandom | head -c4)
+	host_if_name="veth$rand"
+	tmp_cni_name="other$rand"
+	ip link add $tmp_cni_name type veth peer name $host_if_name 
+	ip link set $host_if_name up 
+	ip link set $host_if_name master $bridge_name 
+	ip link set $tmp_cni_name netns $namespace
+	ip netns exec $namespace ip link set dev $tmp_cni_name name $CNI_IFNAME
+	# mac=$(ip netns exec $namespace ip link show $CNI_IFNAME | awk '/ether/ {print $2}')
+
+	if [[ $(label arp true) == "false" ]]; then
+		#bridge is an already used command in kubernetes, it tries to get that
+		/usr/sbin/bridge link set dev $host_if_name learning off
+		/usr/sbin/bridge link set dev $host_if_name flood off
+		/usr/sbin/bridge link set dev $host_if_name mcast_flood off
+		/usr/sbin/bridge link set dev $host_if_name bcast_flood off
+		# /usr/sbin/bridge link set dev $host_if_name neigh_suppress on
+		# /usr/sbin/bridge fdb del $mac dev $host_if_name
+		# echo "bridge fdb add $container_mac dev $host_if_name static"
+		/usr/sbin/bridge fdb add $container_mac dev $host_if_name master static
+		ip netns exec $namespace sysctl -w net.ipv4.conf.all.rp_filter=2
+		ip netns exec $namespace sysctl -w net.ipv4.conf.$CNI_IFNAME.arp_ignore=8
+	fi
+
+	ip netns exec $namespace ip link set $CNI_IFNAME address $container_mac
+	ip netns exec $namespace ip link set $CNI_IFNAME up
+	
+	gateway=$(label gateway)
+	if [[ -n $gateway ]]; then
+		old_int=$(ip  r | sed -n 's/.*via [0-9.]* dev \([^ ]*\) .*/\1/p')
+		old_gw=$(ip  r | sed -n 's/.*via \([0-9.]*\).*/\1/p')
+		ip netns exec $namespace ip route delete default via $old_gw dev $old_int
+		gw_conf="\n
+         \"gateway\": \"$gateway\",
+"
+	else
+		gw_conf=""
+	fi
+	if [[ $asked_ip != "false" ]]; then
+		ip netns exec $namespace ip addr add $container_ip/$subnet_mask_size dev $CNI_IFNAME
+		ip_conf="{
+         \"version\": \"4\",
+         \"address\": \"$container_ip/$subnet_mask_size\",$gw_conf
+	 \"interface\": 0
+    }"
+ 	else
+		ip_conf=""
+	fi
+	if [[ -n $gateway ]]; then
+		ip netns exec $namespace ip route add default via $gateway dev $CNI_IFNAME
+	fi
+
+	echo "2"
+
+output="{
+  \"cniVersion\": \"0.3.1\",
+  \"interfaces\": [                                            
+      {
+          \"name\": \"$CNI_IFNAME\",
+          \"mac\": \"$container_mac\",                            
+          \"sandbox\": \"$CNI_NETNS\" 
+      }
+  ],
+  \"ips\": [$ip_conf]
+}"
+echo "stdout: $output"
+
+echo "$output" >&3
+;;
+
+DEL)
+	sed -i "/$CNI_CONTAINERID\t$CNI_IFNAME/d" $IP_STORE
+	exit 0
+;;
+
+GET)
+	echo "GET not supported"
+	exit 1
+;;
+
+VERSION)
+echo '{
+  "cniVersion": "0.3.1", 
+  "supportedVersions": [ "0.3.0", "0.3.1", "0.4.0" ] 
+}' >&3
+;;
+
+*)
+  echo "Unknown cni commandn: $CNI_COMMAND" 
+  exit 1
+;;
+
+esac
