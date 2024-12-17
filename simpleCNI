@@ -52,7 +52,7 @@ label () {
 }
 
 
-bridge_name=$(label bridge_name simple)
+bridge_name=$(label bridge_name bash0)
 prefix="/var/run/netns/"
 namespace=${CNI_NETNS#"$prefix"}
 
@@ -151,14 +151,6 @@ ADD)
 	   op=$(echo $i | cut -d" " -f1)
 	   value=$(echo $i | cut -d" " -f2)
 	   ip netns exec $namespace sysctl -w $op=$value
-	done
-
-	getall pair.sysctl vals
-	for i in "${vals[@]}"
-	do
-	   op=$(echo $i | cut -d" " -f1)
-	   value=$(echo $i | cut -d" " -f2)
-	   ip netns exec $namespace sysctl -w net.ipv4.conf.$host_if_name.$op=$value
 	done
 	
 	gateway=$(label gateway)
