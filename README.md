@@ -1,6 +1,6 @@
 # SimpleCNI
-A CNI made in bash based on bash-cni
-It can handle multi interface setups with multus
+A CNI made as part of my thesis work. Written in bash based on bash-cni
+It can handle multi interface setups with multus.
 
 ## Setup
 Using multus, place the bash script in the kube node's bin folder. and create a custom network attachment definition like this:
